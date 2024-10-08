@@ -2,11 +2,12 @@ import os
 import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import asyncio
 import backoff
 import numpy as np
 import openai
 import tiktoken
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from transformers import AutoTokenizer
 
 import lotus
@@ -66,6 +67,7 @@ class OpenAIModel(LM):
 
         api_key = api_key or os.environ.get("OPENAI_API_KEY", "None")
         self.client = OpenAI(api_key=api_key if api_key else "None", base_url=api_base)
+        self.async_client = AsyncOpenAI(api_key=api_key if api_key else "None", base_url=api_base)
 
         # TODO: Refactor this
         if self.provider == "openai":
@@ -134,6 +136,47 @@ class OpenAIModel(LM):
 
         return completions
 
+    async def async_handle_chat_request(self, messages: List, **kwargs: Dict[str, Any]) -> Union[List, Tuple[List, List]]:
+        """Asynchronous version of handle_chat_request."""
+        if kwargs.get("logprobs", False):
+            kwargs["top_logprobs"] = 1
+
+        kwargs = {**self.kwargs, **kwargs}
+        kwargs["messages"] = messages
+        response = await self.async_chat_request(**kwargs)
+
+        choices = response["choices"]
+        completions = [c["message"]["content"] for c in choices]
+
+        if kwargs.get("logprobs", False):
+            logprobs = [c["logprobs"] for c in choices]
+            return completions, logprobs
+
+        return completions
+
+    async def async_handle_completion_request(self, messages: List, **kwargs):
+        """Asynchronous version of handle_completion_request."""
+        if not isinstance(messages[0], list):
+            prompt = [self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)]
+        else:
+            prompt = [
+                self.tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+                for message in messages
+            ]
+
+        kwargs = {**self.kwargs, **kwargs}
+        kwargs["prompt"] = prompt
+        response = await self.async_completion_request(**kwargs)
+
+        choices = response["choices"]
+        completions = [c["text"] for c in choices]
+
+        if kwargs.get("logprobs", False):
+            logprobs = [c["logprobs"] for c in choices]
+            return completions, logprobs
+
+        return completions
+
     @backoff.on_exception(
         backoff.expo,
         ERRORS,
@@ -156,6 +199,22 @@ class OpenAIModel(LM):
             return self.handle_chat_request(messages, **kwargs)
         else:
             return self.handle_completion_request(messages, **kwargs)
+    
+    async def async_request(self, messages: List, **kwargs) -> Union[List, Tuple[List, List]]:
+        """
+        Asynchronous version of request to handle requests to the OpenAI server.
+
+        Args:
+            messages (List): A prompt in message format.
+            **kwargs (Dict[str, Any]): Additional keyword arguments for inference.
+
+        Returns:
+            Union[List, Tuple[List, List]]: A list of outputs for each prompt.
+        """
+        if self.use_chat:
+            return await self.async_handle_chat_request(messages, **kwargs)
+        else:
+            return await self.async_handle_completion_request(messages, **kwargs)
 
     def batched_chat_request(self, messages_batch: List, **kwargs) -> Union[List, Tuple[List, List]]:
         """Handle batched chat request to OpenAI server.
@@ -193,18 +252,61 @@ class OpenAIModel(LM):
             return text_ret, logprobs_ret
 
         return text_ret
+    
+    async def async_batched_chat_request(self, messages_batch: List, **kwargs) -> Union[List, Tuple[List, List]]:
+        """
+        Asynchronously handle batched chat request to OpenAI server.
 
-    def __call__(
-        self, messages_batch: Union[List, List[List]], **kwargs: Dict[str, Any]
-    ) -> Union[List, Tuple[List, List]]:
-        lotus.logger.debug(f"OpenAIModel.__call__ messages_batch: {messages_batch}")
-        lotus.logger.debug(f"OpenAIModel.__call__ kwargs: {kwargs}")
-        # Bakes max batch size into model call. # TODO: Figure out less hacky way to do this.
+        Args:
+            messages_batch (List): Either one prompt or a list of prompts in message format.
+            **kwargs (Dict[str, Any]): Additional keyword arguments.
+
+        Returns:
+            Union[List, Tuple[List, List]]: A list of outputs for each prompt in the batch. If logprobs is specified, logprobs are returned.
+        """
+
+        batch_size = len(messages_batch)
+        text_ret = [None] * batch_size
+        logprobs_ret = [None] * batch_size
+        tasks = []
+
+        async def task_function(idx, messages, kwargs):
+            text = await self.generate_async(messages, **kwargs)
+            if kwargs.get("logprobs", False):
+                text, logprobs = text
+                logprobs_ret[idx] = logprobs[0]
+            text_ret[idx] = text[0]
+
+        for idx, messages in enumerate(messages_batch):
+            task = task_function(idx, messages, kwargs)
+            tasks.append(task)
+
+        await asyncio.gather(*tasks)
+
+        if kwargs.get("logprobs", False):
+            return text_ret, logprobs_ret
+
+        return text_ret
+
+    def generate(self, messages_batch: Union[List, List[List]], **kwargs: Dict[str, Any]) -> Union[List, Tuple[List, List]]:
+        """
+        Handles synchronous generation.
+
+        Args:
+            messages_batch (Union[List, List[List]]): A batch of prompts or a single prompt.
+            **kwargs (Dict[str, Any]): Additional inference parameters.
+
+        Returns:
+            Union[List, Tuple[List, List]]: A list of outputs for each prompt in the batch.
+        """
+        lotus.logger.debug(f"OpenAIModel.generate messages_batch: {messages_batch}")
+        lotus.logger.debug(f"OpenAIModel.generate kwargs: {kwargs}")
+        
         if isinstance(messages_batch[0], list) and len(messages_batch) > self.max_batch_size:
             text_ret = []
             logprobs_ret = []
             for i in range(0, len(messages_batch), self.max_batch_size):
-                res = self(messages_batch[i : i + self.max_batch_size], **kwargs)
+                res = self.request(messages_batch[i : i + self.max_batch_size], **kwargs)
                 if kwargs.get("logprobs", False):
                     text, logprobs = res
                     logprobs_ret.extend(logprobs)
@@ -220,6 +322,49 @@ class OpenAIModel(LM):
             return self.batched_chat_request(messages_batch, **kwargs)
 
         return self.request(messages_batch, **kwargs)
+    
+    async def generate_async(self, messages_batch: Union[List, List[List]], **kwargs: Dict[str, Any]) -> Union[List, Tuple[List, List]]:
+        """
+        Asynchronously generate responses from the model.
+
+        Args:
+            messages_batch (Union[List, List[List]]): A batch of prompts or a single prompt.
+            **kwargs (Dict[str, Any]): Additional inference parameters.
+
+        Returns:
+            Union[List, Tuple[List, List]]: A list of outputs for each prompt in the batch.
+        """
+        lotus.logger.debug(f"OpenAIModel.generate_async messages_batch: {messages_batch}")
+        lotus.logger.debug(f"OpenAIModel.generate_async kwargs: {kwargs}")
+
+        if isinstance(messages_batch[0], list) and len(messages_batch) > self.max_batch_size:
+            text_ret = []
+            logprobs_ret = []
+            for i in range(0, len(messages_batch), self.max_batch_size):
+                res = await self.async_request(messages_batch[i : i + self.max_batch_size], **kwargs)
+                if kwargs.get("logprobs", False):
+                    text, logprobs = res
+                    logprobs_ret.extend(logprobs)
+                else:
+                    text = res
+                text_ret.extend(text)
+
+            if kwargs.get("logprobs", False):
+                return text_ret, logprobs_ret
+            return text_ret
+
+        if self.use_chat and isinstance(messages_batch[0], list):
+            return await self.async_batched_chat_request(messages_batch, **kwargs)
+
+        return await self.async_request(messages_batch, **kwargs)
+
+    def __call__(
+        self, messages_batch: Union[List, List[List]], **kwargs: Dict[str, Any]
+    ) -> Union[List, Tuple[List, List]]:
+        lotus.logger.debug(f"OpenAIModel.__call__ messages_batch: {messages_batch}")
+        lotus.logger.debug(f"OpenAIModel.__call__ kwargs: {kwargs}")
+        
+        return self.generate(messages_batch, **kwargs)
 
     def count_tokens(self, prompt: Union[str, list]) -> int:
         if isinstance(prompt, str):
@@ -261,6 +406,18 @@ class OpenAIModel(LM):
         """
         return self.client.chat.completions.create(**kwargs).model_dump()
 
+    async def async_chat_request(self, **kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Send async chat request to OpenAI server.
+
+        Args:
+            **kwargs (Dict[str, Any]): Additional keyword arguments. They can be used to specify things such as the prompt, temperature,
+                      model name, max tokens, etc.
+
+        Returns:
+            dict: OpenAI chat completion response.
+        """
+        return (await self.async_client.chat.completions.create(**kwargs)).model_dump()
+
     def completion_request(self, **kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Send completion request to OpenAI server.
 
@@ -272,6 +429,18 @@ class OpenAIModel(LM):
             dict: OpenAI completion response.
         """
         return self.client.completions.create(**kwargs).model_dump()
+
+    async def async_completion_request(self, **kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Send async completion request to OpenAI server.
+
+        Args:
+            **kwargs (Dict[str, Any]): Additional keyword arguments. They can be used to specify things such as the prompt, temperature,
+                      model name, max tokens, etc.
+
+        Returns:
+            dict: OpenAI completion response.
+        """
+        return (await self.async_client.completions.create(**kwargs)).model_dump()
 
     @property
     def max_tokens(self) -> int:

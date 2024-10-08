@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import asyncio
 
 import lotus
 from lotus.templates import task_instructions
@@ -108,6 +109,62 @@ def compare_batch_binary_cascade(pairs, user_instruction, cascade_threshold, str
         num_large_calls = len(low_conf_idxs)
     return parsed_results, small_tokens, large_tokens, num_large_calls
 
+async def compare_batch_binary_async(pairs, user_instruction, strategy=None):
+    match_prompts = []
+    results = []
+    tokens = 0
+    for doc1, doc2 in pairs:
+        match_prompts.append(get_match_prompt_binary(doc1, doc2, user_instruction, strategy=strategy))
+        tokens += lotus.settings.lm.count_tokens(match_prompts[-1])
+
+    results = await lotus.settings.lm.generate_async(match_prompts)
+    results = list(map(parse_ans_binary, results))
+    return results, tokens
+
+async def compare_batch_binary_cascade_async(pairs, user_instruction, cascade_threshold, strategy=None):
+    match_prompts = []
+    small_tokens = 0
+    for doc1, doc2 in pairs:
+        match_prompts.append(get_match_prompt_binary(doc1, doc2, user_instruction, strategy=strategy))
+        small_tokens += lotus.settings.helper_lm.count_tokens(match_prompts[-1])
+
+    results, helper_logprobs = await lotus.settings.helper_lm.generate_async(match_prompts, logprobs=True)
+    helper_tokens, helper_confidences = lotus.settings.helper_lm.format_logprobs_for_cascade(helper_logprobs)
+
+    parsed_results = []
+    high_conf_idxs = set()
+    for idx, res in enumerate(results):
+        parsed_res = parse_ans_binary(res)
+        parsed_results.append(parsed_res)
+
+        # Find where docunent number is said and look at confidence
+        for idx_j in range(len(helper_tokens[idx]) - 1, -1, -1):
+            if helper_tokens[idx][idx_j].strip(" \n").isnumeric():
+                conf = helper_confidences[idx][idx_j]
+                if conf >= cascade_threshold:
+                    high_conf_idxs.add(idx)
+    
+    large_tokens = 0
+    num_large_calls = 0
+
+    # Handle the low confidence cases
+    if len(high_conf_idxs) != len(helper_logprobs):
+        low_conf_idxs = sorted([i for i in range(len(helper_logprobs)) if i not in high_conf_idxs])
+
+        large_match_prompts = []
+        for i in low_conf_idxs:
+            large_match_prompts.append(match_prompts[i])
+            large_tokens += lotus.settings.lm.count_tokens(large_match_prompts[-1])
+
+        results = await lotus.settings.lm.generate_async(large_match_prompts)
+        for idx, res in enumerate(results):
+            new_idx = low_conf_idxs[idx]
+            parsed_res = parse_ans_binary(res)
+            parsed_results[new_idx] = parsed_res
+
+        num_large_calls = len(low_conf_idxs)
+    
+    return parsed_results, small_tokens, large_tokens, num_large_calls
 
 def llm_naive_sort(
     docs: List[str],
@@ -147,6 +204,34 @@ def llm_naive_sort(
     stats = {"total_tokens": tokens, "total_llm_calls": llm_calls}
     return indexes, stats
 
+async def llm_naive_sort_async(
+    docs: List[str],
+    user_instruction: str,
+    strategy: Optional[str] = None,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Async version of the naive sort algorithm for LLM document sorting."""
+    N = len(docs)
+    pairs = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            pairs.append((docs[i], docs[j]))
+
+    llm_calls = len(pairs)
+    comparisons, tokens = await compare_batch_binary_async(pairs, user_instruction, strategy=strategy)
+    votes = [0] * N
+    idx = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            if comparisons[idx]:
+                votes[i] += 1
+            else:
+                votes[j] += 1
+            idx += 1
+
+    indexes = sorted(range(len(votes)), key=lambda i: votes[i], reverse=True)
+
+    stats = {"total_tokens": tokens, "total_llm_calls": llm_calls}
+    return indexes, stats
 
 def llm_quicksort(
     docs: List[str],
@@ -241,6 +326,76 @@ def llm_quicksort(
 
     return indexes, stats
 
+async def llm_quicksort_async(
+    docs: List[str],
+    user_instruction: str,
+    k: int,
+    embedding: bool = False,
+    strategy: Optional[str] = None,
+    cascade_threshold=None,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Async version of the QuickSort algorithm for LLM document sorting."""
+    stats = {"total_tokens": 0, "total_llm_calls": 0}
+
+    if cascade_threshold is not None:
+        stats["total_small_tokens"] = 0
+        stats["total_large_tokens"] = 0
+        stats["total_small_calls"] = 0
+        stats["total_large_calls"] = 0
+
+    async def partition(indexes, low, high, k):
+        nonlocal stats
+        i = low - 1
+
+        pivot_index = np.random.randint(low, high + 1)
+        pivot_value = indexes[pivot_index]
+
+        pivot = docs[pivot_value]
+        indexes[pivot_index], indexes[high] = indexes[high], indexes[pivot_index]
+
+        pairs = [(docs[indexes[j]], pivot) for j in range(low, high)]
+        if cascade_threshold is None:
+            comparisons, tokens = await compare_batch_binary_async(pairs, user_instruction, strategy=strategy)
+            stats["total_tokens"] += tokens
+            stats["total_llm_calls"] += len(pairs)
+        else:
+            comparisons, small_tokens, large_tokens, num_large_calls = await compare_batch_binary_cascade_async(
+                pairs,
+                user_instruction,
+                cascade_threshold,
+                strategy=strategy,
+            )
+            stats["total_small_tokens"] += small_tokens
+            stats["total_large_tokens"] += large_tokens
+            stats["total_small_calls"] += len(pairs)
+            stats["total_large_calls"] += num_large_calls
+
+        for j, doc1_is_better in enumerate(comparisons, start=low):
+            if doc1_is_better:
+                i += 1
+                indexes[i], indexes[j] = indexes[j], indexes[i]
+
+        indexes[i + 1], indexes[high] = indexes[high], indexes[i + 1]
+        return i + 1
+
+    async def quicksort_recursive(indexes, low, high, k):
+        if high <= low:
+            return
+
+        if low < high:
+            pi = await partition(indexes, low, high, k)
+            left_size = pi - low
+            if left_size + 1 >= k:
+                await quicksort_recursive(indexes, low, pi - 1, k)
+            else:
+                await quicksort_recursive(indexes, low, pi - 1, left_size)
+                await quicksort_recursive(indexes, pi + 1, high, k - left_size - 1)
+
+    indexes = list(range(len(docs)))
+    await quicksort_recursive(indexes, 0, len(indexes) - 1, k)
+
+    return indexes, stats
+
 
 class HeapDoc:
     """Class to define a document for the heap. Keeps track of the number of calls and tokens."""
@@ -259,6 +414,78 @@ class HeapDoc:
         HeapDoc.num_calls += 1
         HeapDoc.total_tokens += lotus.settings.lm.count_tokens(prompt)
         result = lotus.settings.lm(prompt)
+        return parse_ans_binary(result[0])
+
+class AsyncMinHeap:
+    def __init__(self):
+        self.heap = []
+
+    async def push(self, item):
+        """Push an item onto the heap asynchronously."""
+        self.heap.append(item)
+        await self._sift_up(len(self.heap) - 1)
+
+    async def pop(self):
+        """Pop the smallest item off the heap asynchronously."""
+        if len(self.heap) > 1:
+            self._swap(0, len(self.heap) - 1)
+        item = self.heap.pop()
+        await self._sift_down(0)
+        return item
+
+    async def _sift_up(self, idx):
+        """Move the item at index `idx` up to its correct position in the heap."""
+        parent = (idx - 1) // 2
+        if idx > 0 and await self._lt(self.heap[idx], self.heap[parent]):
+            self._swap(idx, parent)
+            await self._sift_up(parent)
+
+    async def _sift_down(self, idx):
+        """Move the item at index `idx` down to its correct position in the heap."""
+        child = 2 * idx + 1
+        if child < len(self.heap):
+            if child + 1 < len(self.heap) and await self._lt(self.heap[child + 1], self.heap[child]):
+                child += 1
+            if await self._lt(self.heap[child], self.heap[idx]):
+                self._swap(child, idx)
+                await self._sift_down(child)
+
+    def _swap(self, i, j):
+        """Swap two items in the heap."""
+        self.heap[i], self.heap[j] = self.heap[j], self.heap[i]
+
+    async def nsmallest(self, n):
+        """Return the n smallest elements from the heap asynchronously."""
+        result = []
+        for _ in range(min(n, len(self.heap))):
+            result.append(await self.pop())
+        return result
+
+    async def _lt(self, a, b):
+        """Asynchronously compare two items using their __lt__ method."""
+        return await a.__lt__(b)
+
+class AsyncHeapDoc:
+    """Class to define a document for the heap in an asynchronous context. 
+    Keeps track of the number of calls and tokens."""
+
+    num_calls = 0
+    total_tokens = 0
+    strategy = None
+
+    def __init__(self, doc, user_instruction, idx):
+        self.doc = doc
+        self.user_instruction = user_instruction
+        self.idx = idx
+
+    async def __lt__(self, other):
+        """Asynchronously compare two documents to see which one is less than the other."""
+        prompt = get_match_prompt_binary(self.doc, other.doc, self.user_instruction, strategy=self.strategy)
+        AsyncHeapDoc.num_calls += 1
+        AsyncHeapDoc.total_tokens += lotus.settings.lm.count_tokens(prompt)
+
+        # Asynchronously call the language model
+        result = await lotus.settings.lm.generate_async(prompt)
         return parse_ans_binary(result[0])
 
 
@@ -288,6 +515,32 @@ def llm_heapsort(
     indexes = [heapq.heappop(heap).idx for _ in range(len(heap))]
 
     stats = {"total_tokens": HeapDoc.total_tokens, "total_llm_calls": HeapDoc.num_calls}
+    return indexes, stats
+
+async def llm_heapsort_async(
+    docs: List[str],
+    user_instruction: str,
+    k: int,
+    strategy: Optional[str] = None,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Async version of the HeapSort algorithm for LLM document sorting."""
+    AsyncHeapDoc.num_calls = 0
+    AsyncHeapDoc.total_tokens = 0
+    AsyncHeapDoc.strategy = strategy
+
+    N = len(docs)
+    heap = AsyncMinHeap()
+
+    for idx in range(N):
+        heap_doc = AsyncHeapDoc(docs[idx], user_instruction, idx)
+        await heap.push(heap_doc)
+
+    top_k_heap = await heap.nsmallest(k)
+
+    indexes = [doc.idx for doc in top_k_heap]
+
+    stats = {"total_tokens": AsyncHeapDoc.total_tokens, "total_llm_calls": AsyncHeapDoc.num_calls}
+    
     return indexes, stats
 
 
@@ -389,6 +642,68 @@ class SemTopKDataframe:
             sorted_order, stats = llm_heapsort(df_txt, formatted_usr_instr, K, strategy=strategy)
         elif method == "naive":
             sorted_order, stats = llm_naive_sort(
+                df_txt,
+                formatted_usr_instr,
+                strategy=strategy,
+            )
+        else:
+            raise ValueError(f"Method {method} not recognized")
+
+        new_df = self._obj.reset_index(drop=True)
+        new_df = new_df.reindex(sorted_order).reset_index(drop=True)
+        new_df = new_df.head(K)
+        if return_stats:
+            return new_df, stats
+        return new_df
+
+@pd.api.extensions.register_dataframe_accessor("sem_topk_async")
+class SemTopKAsyncDataframe:
+    """DataFrame accessor for asynchronous semantic top k."""
+
+    def __init__(self, pandas_obj):
+        self._validate(pandas_obj)
+        self._obj = pandas_obj
+
+    @staticmethod
+    def _validate(obj):
+        pass
+
+    async def __call__(
+        self,
+        user_instruction: str,
+        K: int,
+        method: str = "quick",
+        strategy: Optional[str] = None,
+        group_by: Optional[List[str]] = None,
+        cascade_threshold: Optional[float] = None,
+        return_stats: bool = False,
+    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, Any]]]:
+        """Async method to sort DataFrame and return top K rows."""
+        lotus.logger.debug(f"Sorting DataFrame with user instruction: {user_instruction}")
+        col_li = lotus.nl_expression.parse_cols(user_instruction)
+        lotus.logger.debug(f"Columns: {col_li}")
+
+        # check that column exists
+        for column in col_li:
+            if column not in self._obj.columns:
+                raise ValueError(f"Column {column} not found in DataFrame. Given usr instruction: {user_instruction}")
+
+        df_txt = task_instructions.df2text(self._obj, col_li)
+        formatted_usr_instr = lotus.nl_expression.nle2str(user_instruction, col_li)
+
+        if method in ["quick", "quick-sem"]:
+            sorted_order, stats = await llm_quicksort_async(
+                df_txt,
+                formatted_usr_instr,
+                K,
+                embedding=method == "quick-sem",
+                strategy=strategy,
+                cascade_threshold=cascade_threshold,
+            )
+        elif method == "heap":
+            sorted_order, stats = await llm_heapsort_async(df_txt, formatted_usr_instr, K, strategy=strategy)
+        elif method == "naive":
+            sorted_order, stats = await llm_naive_sort_async(
                 df_txt,
                 formatted_usr_instr,
                 strategy=strategy,
